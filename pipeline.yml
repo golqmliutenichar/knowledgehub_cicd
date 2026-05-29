@@ -1,0 +1,337 @@
+name: Knowledge Hub - Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_firewall:
+        description: 'Deploy Azure Firewall? (true/false)'
+        required: true
+        default: 'false'
+      deploy_database:
+        description: 'Deploy MySQL Database? (true/false)'
+        required: true
+        default: 'false'
+
+env:
+  RESOURCE_GROUP: KnowledgeHub-RG
+  LOCATION: swedencentral
+  HUB_VNET: KH-Hub-Vnet
+  SPOKE_VNET: KH-Spoke-Vnet
+
+jobs:
+
+  # ── Stage 1: VNets ──────────────────────────────────────
+  deploy-vnets:
+    name: Deploy VNets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Resource Group
+        run: |
+          az group create \
+            --name $RESOURCE_GROUP \
+            --location $LOCATION \
+            --tags Project=KnowledgeHub Environment=Production ManagedBy=IaC
+
+      - name: Deploy Hub VNet
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Vnets/HubVnet_Template.bicep \
+            --name Deploy-HubVnet
+
+      - name: Deploy Spoke VNet
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Vnets/SpokeVnet_Template.bicep \
+            --name Deploy-SpokeVnet
+
+  # ── Stage 2: NSGs and Route Tables ─────────────────────
+  deploy-security:
+    name: Deploy NSGs and Route Tables
+    runs-on: ubuntu-latest
+    needs: deploy-vnets
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Database NSG
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/NSGs/DatabaseSubnetNSG_Template.bicep \
+            --name Deploy-DatabaseNSG
+
+      - name: Deploy App Integration NSG
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/NSGs/AppIntSubnetNSG_Template.bicep \
+            --name Deploy-AppIntNSG
+
+      - name: Deploy Route Table
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/RouteTables/DefaultToFirewallRT_Template.bicep \
+            --name Deploy-RouteTable
+
+  # ── Stage 3: VPN Gateway ───────────────────────────────
+  deploy-vpn:
+    name: Deploy VPN Gateway
+    runs-on: ubuntu-latest
+    needs: deploy-vnets
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy VPN Gateway Public IP
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/VPN/VPNGatewayPublicIP_Template.bicep \
+            --name Deploy-VPNPublicIP
+
+      - name: Deploy VPN Gateway (takes ~30 mins)
+        run: |
+          GATEWAY_SUBNET_ID=$(az network vnet subnet show \
+            --resource-group $RESOURCE_GROUP \
+            --vnet-name $HUB_VNET \
+            --name GatewaySubnet \
+            --query id --output tsv)
+
+          VPN_PUBLIC_IP_ID=$(az network public-ip show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-VPNGateway-PublicIP \
+            --query id --output tsv)
+
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/VPN/VPNGateway_Template.bicep \
+            --name Deploy-VPNGateway \
+            --parameters \
+              subnetId=$GATEWAY_SUBNET_ID \
+              publicIpAddressId=$VPN_PUBLIC_IP_ID
+
+      - name: Deploy Local Network Gateway
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/VPN/LocalGateway_Template.bicep \
+            --name Deploy-LocalGateway
+
+      - name: Deploy VPN Connection
+        run: |
+          VPN_GW_ID=$(az network vnet-gateway show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-VPN-Gateway \
+            --query id --output tsv)
+
+          LOCAL_GW_ID=$(az network local-gateway show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-Local-Gateway \
+            --query id --output tsv)
+
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/VPN/VPNCon_Template.bicep \
+            --name Deploy-VPNConnection \
+            --parameters \
+              vpnGatewayId=$VPN_GW_ID \
+              localGatewayId=$LOCAL_GW_ID \
+              sharedKey=${{ secrets.VPN_SHARED_KEY }}
+
+      - name: Print VPN Gateway Public IP
+        run: |
+          VPN_IP=$(az network public-ip show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-VPNGateway-PublicIP \
+            --query ipAddress --output tsv)
+          echo "VPN Gateway Public IP: $VPN_IP"
+          echo "Configure this IP in pfSense as the Azure peer"
+
+  # ── Stage 4: VNet Peering ──────────────────────────────
+  deploy-peering:
+    name: Deploy VNet Peering
+    runs-on: ubuntu-latest
+    needs: deploy-vpn
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Hub to Spoke Peering
+        run: |
+          SPOKE_VNET_ID=$(az network vnet show \
+            --resource-group $RESOURCE_GROUP \
+            --name $SPOKE_VNET \
+            --query id --output tsv)
+
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Vnets/VnetPeering_Template.bicep \
+            --name Deploy-HubToSpoke \
+            --parameters spokeVnetId=$SPOKE_VNET_ID
+
+      - name: Deploy Spoke to Hub Peering
+        run: |
+          HUB_VNET_ID=$(az network vnet show \
+            --resource-group $RESOURCE_GROUP \
+            --name $HUB_VNET \
+            --query id --output tsv)
+
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Vnets/VnetPeering2_Template.bicep \
+            --name Deploy-SpokeToHub \
+            --parameters hubVnetId=$HUB_VNET_ID
+
+  # ── Stage 5: Firewall (optional) ──────────────────────
+  deploy-firewall:
+    name: Deploy Azure Firewall
+    runs-on: ubuntu-latest
+    needs: deploy-peering
+    if: ${{ github.event.inputs.deploy_firewall == 'true' }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Firewall Public IPs
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Firewall/FirewallPublicIPs_Template.bicep \
+            --name Deploy-FirewallPublicIPs
+
+      - name: Deploy Firewall Policy
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Firewall/FirewallPolicy_Template.bicep \
+            --name Deploy-FirewallPolicy
+
+      - name: Deploy Azure Firewall
+        run: |
+          FIREWALL_PUBLIC_IP_ID=$(az network public-ip show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-Firewall-PublicIP \
+            --query id --output tsv)
+
+          FIREWALL_MGMT_IP_ID=$(az network public-ip show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-Firewall-ManagementPublicIP \
+            --query id --output tsv)
+
+          FIREWALL_POLICY_ID=$(az network firewall policy show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-Firewall-Policy \
+            --query id --output tsv)
+
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Firewall/FirewallBasic_Template.bicep \
+            --name Deploy-Firewall \
+            --parameters \
+              firewallPublicIPId=$FIREWALL_PUBLIC_IP_ID \
+              firewallManagementPublicIPId=$FIREWALL_MGMT_IP_ID \
+              firewallPolicyId=$FIREWALL_POLICY_ID
+
+  # ── Stage 6: Database (optional) ──────────────────────
+  deploy-database:
+    name: Deploy MySQL Database
+    runs-on: ubuntu-latest
+    needs: deploy-peering
+    if: ${{ github.event.inputs.deploy_database == 'true' }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy MySQL Flexible Server
+        run: |
+          az deployment group create \
+            --resource-group $RESOURCE_GROUP \
+            --template-file Bicep/Database/MySQLFlexibleServer_Template.bicep \
+            --name Deploy-MySQL \
+            --parameters \
+              administratorLoginPassword=${{ secrets.MYSQL_PASSWORD }}
+
+      - name: Create Private Endpoint for MySQL
+        run: |
+          MYSQL_ID=$(az mysql flexible-server show \
+            --resource-group $RESOURCE_GROUP \
+            --name kh-monitoring-db \
+            --query id --output tsv)
+
+          az network private-endpoint create \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-MySQL-PrivateEndpoint \
+            --location $LOCATION \
+            --vnet-name $SPOKE_VNET \
+            --subnet KH-PrivateEndpoint-Subnet \
+            --private-connection-resource-id $MYSQL_ID \
+            --group-id mysqlServer \
+            --connection-name KH-MySQL-PrivateConnection \
+            --tags Project=KnowledgeHub Service=Database ManagedBy=IaC
+
+      - name: Create Private DNS Zone for MySQL
+        run: |
+          az network private-dns zone create \
+            --resource-group $RESOURCE_GROUP \
+            --name "privatelink.mysql.database.azure.com"
+
+          az network private-dns link vnet create \
+            --resource-group $RESOURCE_GROUP \
+            --zone-name "privatelink.mysql.database.azure.com" \
+            --name KH-MySQL-DNS-Link-Spoke \
+            --virtual-network $SPOKE_VNET \
+            --registration-enabled false
+
+          az network private-dns link vnet create \
+            --resource-group $RESOURCE_GROUP \
+            --zone-name "privatelink.mysql.database.azure.com" \
+            --name KH-MySQL-DNS-Link-Hub \
+            --virtual-network $HUB_VNET \
+            --registration-enabled false
+
+          PE_NIC_ID=$(az network private-endpoint show \
+            --resource-group $RESOURCE_GROUP \
+            --name KH-MySQL-PrivateEndpoint \
+            --query 'networkInterfaces[0].id' --output tsv)
+
+          PE_IP=$(az network nic show \
+            --ids $PE_NIC_ID \
+            --query 'ipConfigurations[0].privateIPAddress' --output tsv)
+
+          az network private-dns record-set a add-record \
+            --resource-group $RESOURCE_GROUP \
+            --zone-name "privatelink.mysql.database.azure.com" \
+            --record-set-name "kh-monitoring-db" \
+            --ipv4-address $PE_IP
+
+          echo "MySQL Private Endpoint IP: $PE_IP"
