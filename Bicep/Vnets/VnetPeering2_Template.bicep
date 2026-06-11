@@ -9,7 +9,7 @@ resource spokeToHubPeering 'Microsoft.Network/virtualNetworks/virtualNetworkPeer
     allowVirtualNetworkAccess: true
     allowForwardedTraffic: true
     allowGatewayTransit: false
-    useRemoteGateways: true
+    useRemoteGateways: false
     remoteVirtualNetwork: {
       id: hubVnetId
     }
