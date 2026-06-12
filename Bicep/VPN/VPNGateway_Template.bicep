@@ -8,7 +8,7 @@ param location string = 'swedencentral'
 param gatewayType string = 'Vpn'
 
 // VpnGw1 is the minimum for route-based S2S VPN
-param sku string = 'VpnGw1'
+param sku string = 'VpnGw1AZ'
 param vpnGatewayGeneration string = 'Generation1'
 
 @allowed([
