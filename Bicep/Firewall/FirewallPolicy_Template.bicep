@@ -11,8 +11,5 @@ resource firewallPolicy 'Microsoft.Network/firewallPolicies@2021-02-01' = {
       tier: 'Basic'
     }
     threatIntelMode: 'Alert'
-    dnsSettings: {
-      enableProxy: true
-    }
   }
 }
