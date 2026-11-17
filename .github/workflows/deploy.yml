@@ -1,0 +1,191 @@
+name: Deploy - Knowledge Hub
+
+# Builds the whole landing zone from infra/main.bicep, then builds the API container
+# and deploys it to Azure Container Apps. Firewall and VPN are opt-in (they cost money);
+# remove them again with the "Teardown" workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_firewall:
+        description: 'Deploy Azure Firewall (costs money per hour)'
+        type: boolean
+        default: false
+      deploy_vpn:
+        description: 'Deploy VPN Gateway + S2S connection (~30-45 min, costs money per hour)'
+        type: boolean
+        default: false
+      deploy_api:
+        description: 'Build and deploy the API container'
+        type: boolean
+        default: true
+      on_prem_public_ip:
+        description: 'Public IP of the pfSense side (empty = repository variable ON_PREM_PUBLIC_IP)'
+        type: string
+        default: ''
+      db_cpu_threshold:
+        description: 'Database CPU % for the alert (lower it to test the alert)'
+        type: string
+        default: '80'
+
+permissions:
+  id-token: write   # OIDC login to Azure, no client secret that can expire
+  contents: read
+
+env:
+  RESOURCE_GROUP: KostovRG
+
+jobs:
+  test:
+    name: Test code and templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: API unit tests
+        working-directory: api
+        run: |
+          pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+      - name: Build Bicep
+        run: |
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          az bicep build --file infra/app.bicep --stdout > /dev/null
+
+  infra:
+    name: Deploy landing zone
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      acr_name: ${{ steps.deploy.outputs.acr_name }}
+      acr_login_server: ${{ steps.deploy.outputs.acr_login_server }}
+      mysql_fqdn: ${{ steps.deploy.outputs.mysql_fqdn }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Check the resource group exists
+        run: |
+          az group show --name "$RESOURCE_GROUP" --query "{name:name, tags:tags}" -o json || {
+            echo "::error::Resource group $RESOURCE_GROUP not found. Run scripts/setup-azure.sh first (see README)."
+            exit 1
+          }
+
+      - name: Start the database if it was stopped
+        run: |
+          for server in $(az mysql flexible-server list -g "$RESOURCE_GROUP" --query "[?state=='Stopped'].name" -o tsv); do
+            echo "Starting $server"
+            az mysql flexible-server start -g "$RESOURCE_GROUP" -n "$server"
+          done
+
+      - name: Check what already exists
+        id: state
+        run: |
+          fw=$(az resource list -g "$RESOURCE_GROUP" --resource-type Microsoft.Network/azureFirewalls --query "length(@)" -o tsv)
+          gw=$(az resource list -g "$RESOURCE_GROUP" --resource-type Microsoft.Network/virtualNetworkGateways --query "length(@)" -o tsv)
+          echo "firewall_exists=$([ "$fw" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "vpn_exists=$([ "$gw" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Firewall present: $fw, VPN gateway present: $gw"
+
+      - name: Deploy main.bicep
+        id: deploy
+        env:
+          MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
+          VPN_SHARED_KEY: ${{ secrets.VPN_SHARED_KEY }}
+          ON_PREM_IP: ${{ inputs.on_prem_public_ip || vars.ON_PREM_PUBLIC_IP }}
+          ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+          DEPLOY_FIREWALL: ${{ inputs.deploy_firewall }}
+          DEPLOY_VPN: ${{ inputs.deploy_vpn }}
+          FIREWALL_EXISTS: ${{ steps.state.outputs.firewall_exists }}
+          VPN_EXISTS: ${{ steps.state.outputs.vpn_exists }}
+          DB_CPU_THRESHOLD: ${{ inputs.db_cpu_threshold }}
+        run: |
+          if [ "$DEPLOY_VPN" = "true" ] && [ -z "$ON_PREM_IP" ]; then
+            echo "::error::deploy_vpn needs the public IP of the pfSense side (input or variable ON_PREM_PUBLIC_IP)."
+            exit 1
+          fi
+
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "main-${GITHUB_RUN_NUMBER}" \
+            --template-file infra/main.bicep \
+            --parameters \
+              deployFirewall="$DEPLOY_FIREWALL" \
+              deployVpn="$DEPLOY_VPN" \
+              firewallExists="$FIREWALL_EXISTS" \
+              vpnExists="$VPN_EXISTS" \
+              onPremPublicIp="$ON_PREM_IP" \
+              vpnSharedKey="$VPN_SHARED_KEY" \
+              mysqlAdminPassword="$MYSQL_ADMIN_PASSWORD" \
+              alertEmail="$ALERT_EMAIL" \
+              dbCpuThreshold="$DB_CPU_THRESHOLD" \
+            --query properties.outputs -o json > outputs.json
+
+          out() { jq -r ".$1.value" outputs.json; }
+          echo "acr_name=$(out acrName)" >> "$GITHUB_OUTPUT"
+          echo "acr_login_server=$(out acrLoginServer)" >> "$GITHUB_OUTPUT"
+          echo "mysql_fqdn=$(out mysqlFqdn)" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Landing zone deployed"
+            echo "| Output | Value |"
+            echo "|---|---|"
+            for k in mysqlFqdn acrLoginServer containerAppsDomain containerAppsStaticIp vpnGatewayPublicIp firewallPrivateIp; do
+              echo "| $k | $(out $k) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  api:
+    name: Build and deploy API container
+    needs: infra
+    if: ${{ inputs.deploy_api }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push the image
+        env:
+          ACR_NAME: ${{ needs.infra.outputs.acr_name }}
+          IMAGE: ${{ needs.infra.outputs.acr_login_server }}/monitoring-api:${{ github.sha }}
+        run: |
+          az acr login --name "$ACR_NAME"
+          docker build -t "$IMAGE" api
+          docker push "$IMAGE"
+
+      - name: Deploy app.bicep
+        env:
+          IMAGE: ${{ needs.infra.outputs.acr_login_server }}/monitoring-api:${{ github.sha }}
+          ACR_LOGIN_SERVER: ${{ needs.infra.outputs.acr_login_server }}
+          DB_HOST: ${{ needs.infra.outputs.mysql_fqdn }}
+          MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          fqdn=$(az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "app-${GITHUB_RUN_NUMBER}" \
+            --template-file infra/app.bicep \
+            --parameters \
+              image="$IMAGE" \
+              acrLoginServer="$ACR_LOGIN_SERVER" \
+              dbHost="$DB_HOST" \
+              dbPassword="$MYSQL_ADMIN_PASSWORD" \
+              apiKey="$API_KEY" \
+            --query properties.outputs.fqdn.value -o tsv)
+          echo "## API deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Private URL (only from the VNet or over the VPN): https://$fqdn" >> "$GITHUB_STEP_SUMMARY"

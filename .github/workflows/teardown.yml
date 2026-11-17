@@ -1,0 +1,103 @@
+name: Teardown - firewall and VPN
+
+# Removes the expensive parts (Azure Firewall, VPN Gateway) and can stop the database.
+# Everything else stays, so "Deploy" brings them back in one run.
+# Also runs every night at 03:00 (Amsterdam time) as a safety net against forgotten resources.
+
+on:
+  workflow_dispatch:
+    inputs:
+      remove_vpn:
+        description: 'Remove VPN Gateway, connection and its public IP'
+        type: boolean
+        default: true
+      remove_firewall:
+        description: 'Remove Azure Firewall, its public IPs and the routes to it'
+        type: boolean
+        default: true
+      stop_database:
+        description: 'Stop the MySQL server (no compute cost; storage still billed)'
+        type: boolean
+        default: false
+      confirm:
+        description: 'Type "teardown" to confirm'
+        type: string
+        required: true
+  schedule:
+    - cron: '0 2 * * *'   # 02:00 UTC = 03:00 CET, after any evening session
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: KostovRG
+  # On the nightly run there are no inputs: remove firewall and VPN, leave the database running
+  REMOVE_VPN: ${{ github.event_name == 'schedule' || inputs.remove_vpn }}
+  REMOVE_FIREWALL: ${{ github.event_name == 'schedule' || inputs.remove_firewall }}
+  STOP_DATABASE: ${{ github.event_name != 'schedule' && inputs.stop_database }}
+
+jobs:
+  teardown:
+    name: Remove expensive resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ github.event_name == 'schedule' || inputs.confirm == 'teardown' }}
+    steps:
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Remove the VPN
+        if: env.REMOVE_VPN == 'true'
+        run: |
+          rg="$RESOURCE_GROUP"
+          if ! az network vnet-gateway show -g "$rg" -n KH-VPN-Gateway -o none 2>/dev/null; then
+            echo "No VPN gateway, nothing to remove."; exit 0
+          fi
+          # The spoke may not keep using a gateway that is being deleted
+          az network vnet peering update -g "$rg" --vnet-name KH-Spoke-Vnet -n Spoke-to-Hub --set useRemoteGateways=false -o none
+          az network vnet peering update -g "$rg" --vnet-name KH-Hub-Vnet -n Hub-to-Spoke --set allowGatewayTransit=false -o none
+          az network vpn-connection delete -g "$rg" -n KH-VPN-Connection || true
+          echo "Deleting the gateway (10-20 minutes)..."
+          az network vnet-gateway delete -g "$rg" -n KH-VPN-Gateway
+          az network public-ip delete -g "$rg" -n KH-VPNGateway-PublicIP || true
+          echo "VPN removed (the free local network gateway is kept)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the firewall
+        if: env.REMOVE_FIREWALL == 'true'
+        run: |
+          rg="$RESOURCE_GROUP"
+          if [ "$(az resource list -g "$rg" --resource-type Microsoft.Network/azureFirewalls --query "length(@)" -o tsv)" = "0" ]; then
+            echo "No firewall, nothing to remove."; exit 0
+          fi
+          # Detach the route tables first, otherwise traffic is sent to a firewall that is gone
+          az network vnet subnet update -g "$rg" --vnet-name KH-Spoke-Vnet -n KH-PrivateEndpoint-Subnet --remove routeTable -o none || true
+          az network vnet subnet update -g "$rg" --vnet-name KH-Spoke-Vnet -n KH-ContainerApps-Subnet --remove routeTable -o none || true
+          az network vnet subnet update -g "$rg" --vnet-name KH-Hub-Vnet -n GatewaySubnet --remove routeTable -o none || true
+          az network route-table delete -g "$rg" -n KH-Spoke-RouteTable || true
+          az network route-table delete -g "$rg" -n KH-Gateway-RouteTable || true
+          az resource delete -g "$rg" -n KH-Hub-Firewall --resource-type Microsoft.Network/azureFirewalls
+          az network public-ip delete -g "$rg" -n KH-Firewall-PublicIP || true
+          az network public-ip delete -g "$rg" -n KH-Firewall-ManagementPublicIP || true
+          echo "Firewall removed (the free firewall policy is kept)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the database
+        if: env.STOP_DATABASE == 'true'
+        run: |
+          for server in $(az mysql flexible-server list -g "$RESOURCE_GROUP" --query "[?state=='Ready'].name" -o tsv); do
+            az mysql flexible-server stop -g "$RESOURCE_GROUP" -n "$server"
+            echo "Stopped $server (Deploy starts it again)." >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: What is left
+        run: |
+          {
+            echo "## Resources still in $RESOURCE_GROUP"
+            echo '```'
+            az resource list -g "$RESOURCE_GROUP" --query "[].{name:name, type:type}" -o table
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

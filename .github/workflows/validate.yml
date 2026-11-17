@@ -1,0 +1,39 @@
+name: Validate
+
+# Runs on every push and pull request: no Azure login needed.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: API unit tests
+        working-directory: api
+        run: |
+          pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+
+      - name: Monitor unit tests
+        working-directory: monitor
+        run: |
+          pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+
+      - name: Build and lint Bicep
+        run: |
+          for f in infra/main.bicep infra/app.bicep infra/governance.bicep; do
+            az bicep build --file "$f" --stdout > /dev/null
+            az bicep lint --file "$f"
+          done
