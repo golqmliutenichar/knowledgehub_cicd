@@ -66,6 +66,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check required secrets
+        env:
+          MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
+          API_KEY: ${{ secrets.API_KEY }}
+          VPN_SHARED_KEY: ${{ secrets.VPN_SHARED_KEY }}
+          DEPLOY_API: ${{ inputs.deploy_api }}
+          DEPLOY_VPN: ${{ inputs.deploy_vpn }}
+        run: |
+          missing=""
+          [ -z "$MYSQL_ADMIN_PASSWORD" ] && missing="$missing MYSQL_ADMIN_PASSWORD"
+          [ "$DEPLOY_API" = "true" ] && [ -z "$API_KEY" ] && missing="$missing API_KEY"
+          [ "$DEPLOY_VPN" = "true" ] && [ -z "$VPN_SHARED_KEY" ] && missing="$missing VPN_SHARED_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+          echo "All required secrets are set."
+
       - name: Login to Azure (OIDC)
         uses: azure/login@v2
         with:
@@ -90,6 +108,14 @@ jobs:
       - name: Check what already exists
         id: state
         run: |
+          # A firewall or gateway stuck in "Failed" must be deleted before Azure accepts a retry
+          for type in Microsoft.Network/azureFirewalls Microsoft.Network/virtualNetworkGateways; do
+            for id in $(az resource list -g "$RESOURCE_GROUP" --resource-type "$type" --query "[?provisioningState=='Failed'].id" -o tsv); do
+              echo "::warning::$id is in state Failed, deleting it so it can be deployed again"
+              az resource delete --ids "$id"
+            done
+          done
+
           fw=$(az resource list -g "$RESOURCE_GROUP" --resource-type Microsoft.Network/azureFirewalls --query "length(@)" -o tsv)
           gw=$(az resource list -g "$RESOURCE_GROUP" --resource-type Microsoft.Network/virtualNetworkGateways --query "length(@)" -o tsv)
           echo "firewall_exists=$([ "$fw" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
