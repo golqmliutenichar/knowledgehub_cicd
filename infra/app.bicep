@@ -27,8 +27,8 @@ param dbPassword string
 @secure()
 param apiKey string
 
-@description('0 = scale to zero when idle (cheapest).')
-param minReplicas int = 0
+@description('1 = always one replica ready (no cold start for the 5-minute monitor runs); 0 = scale to zero, cheapest but the first request waits for the container to start.')
+param minReplicas int = 1
 
 resource env 'Microsoft.App/managedEnvironments@2024-03-01' existing = {
   name: environmentName

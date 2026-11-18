@@ -49,7 +49,7 @@ def load_settings():
         "interval": int(os.getenv("INTERVAL", "60")),
         "api_url": os.getenv("API_URL", "").rstrip("/"),
         "api_key": os.getenv("API_KEY", ""),
-        "timeout": float(os.getenv("REQUEST_TIMEOUT", "15")),
+        "timeout": float(os.getenv("REQUEST_TIMEOUT", "30")),
         "check_cloud": os.getenv("CHECK_CLOUD", "true").lower() == "true",
     }
 
