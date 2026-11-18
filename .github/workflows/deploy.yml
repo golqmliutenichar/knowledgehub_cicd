@@ -135,6 +135,9 @@ jobs:
           VPN_EXISTS: ${{ steps.state.outputs.vpn_exists }}
           DB_CPU_THRESHOLD: ${{ inputs.db_cpu_threshold }}
         run: |
+          if [ -z "$ALERT_EMAIL" ]; then
+            echo "::warning::Variable ALERT_EMAIL is not set: alerts will fire but nobody gets an email (Settings > Secrets and variables > Actions > Variables)."
+          fi
           if [ "$DEPLOY_VPN" = "true" ] && [ -z "$ON_PREM_IP" ]; then
             echo "::error::deploy_vpn needs the public IP of the pfSense side (input or variable ON_PREM_PUBLIC_IP)."
             exit 1
