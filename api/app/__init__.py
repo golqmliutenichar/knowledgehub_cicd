@@ -28,12 +28,14 @@ def create_app(overrides=None):
 
     db.init_app(app)
     app.register_blueprint(bp)
-    state = {"tables_ready": False, "last_try": 0.0}
+    state = {"tables_ready": False, "last_try": None}
 
     def ensure_tables():
         """Create the table once. A database that is down must not stop the API from starting,
         so /health can still answer and report the problem."""
-        if state["tables_ready"] or time.monotonic() - state["last_try"] < 30:
+        if state["tables_ready"]:
+            return
+        if state["last_try"] is not None and time.monotonic() - state["last_try"] < 30:
             return
         state["last_try"] = time.monotonic()
         try:
