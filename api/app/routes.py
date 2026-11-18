@@ -27,8 +27,8 @@ def health():
     start = time.perf_counter()
     try:
         db.session.execute(text("SELECT 1"))
-    except Exception:  # any driver error means the database is not usable
-        log.exception("Health check: database not reachable")
+    except Exception as error:  # any driver error means the database is not usable
+        log.warning("Health check: database not reachable: %s", str(error).splitlines()[0][:300])
         return jsonify(status="degraded", database="unreachable"), 503
     latency = round((time.perf_counter() - start) * 1000, 1)
     return jsonify(status="ok", database="ok", db_latency_ms=latency)

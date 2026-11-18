@@ -28,12 +28,29 @@ def create_app(overrides=None):
 
     db.init_app(app)
     app.register_blueprint(bp)
+    state = {"tables_ready": False, "last_try": 0.0}
+
+    def ensure_tables():
+        """Create the table once. A database that is down must not stop the API from starting,
+        so /health can still answer and report the problem."""
+        if state["tables_ready"] or time.monotonic() - state["last_try"] < 30:
+            return
+        state["last_try"] = time.monotonic()
+        try:
+            db.create_all()
+            state["tables_ready"] = True
+            log.info("Database ready")
+        except Exception as error:  # driver errors differ per database
+            log.warning("Database not reachable yet, will retry: %s", str(error).splitlines()[0][:300])
+
     with app.app_context():
-        db.create_all()   # creates the measurements table on first start
+        ensure_tables()
 
     @app.before_request
     def start_timer():
         g.start = time.perf_counter()
+        if request.path.startswith("/api/"):
+            ensure_tables()
 
     @app.after_request
     def log_request(response):

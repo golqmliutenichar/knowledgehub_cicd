@@ -23,7 +23,7 @@ def database_settings():
     port = os.getenv("DB_PORT", "3306")
     url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{name}?charset=utf8mb4"
     options = {
-        "connect_args": {"ssl": {"ca": certifi.where()}},
+        "connect_args": {"ssl": {"ca": certifi.where()}, "connect_timeout": 5},
         "pool_pre_ping": True,   # reconnect after the server closed an idle connection
         "pool_recycle": 280,
     }
